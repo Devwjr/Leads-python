@@ -1,0 +1,14 @@
+dentista
+advogado
+restaurante
+academia
+clinica
+imobiliaria
+contabilidade
+agencia marketing
+igreja
+farmacia
+hotel
+petshop
+academia crossfit
+clinica estetica
