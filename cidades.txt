@@ -9,3 +9,4 @@ brasilia
 fortaleza
 goiania
 juiz de fora
+rio grande do sul
