@@ -1,0 +1,6 @@
+config.json
+leads.xlsx
+*.tmp
+*.log
+__pycache__/
+warmup.json
