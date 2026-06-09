@@ -12,3 +12,50 @@ hotel
 petshop
 academia crossfit
 clinica estetica
+supermercado
+mercearia
+padaria
+acougue
+sorveteria
+cafeteria
+lanchonete
+pizzaria
+hamburgueria
+churrascaria
+bar
+casa noturna
+salon de beleza
+barbearia
+clinica psicologia
+clinica fisioterapia
+hospital
+laboratorio
+otica
+loja roupas
+loja calcados
+loja moveis
+loja eletronicos
+loja material construcao
+mecanica
+borracharia
+lava jato
+oficina
+transportadora
+escola
+curso
+faculdade
+creche
+condominio
+construtora
+engenharia
+arquitetura
+grafica
+fotografia
+eventos
+buffet
+agropecuaria
+marcenaria
+serralheria
+dedetizadora
+seguranca privada
+limpeza
