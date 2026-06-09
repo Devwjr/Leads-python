@@ -23,25 +23,49 @@ def carregar_lista(arquivo):
 nichos = carregar_lista("nichos.txt")
 cidades = carregar_lista("cidades.txt")
 
-def extrair_emails_e_telefones(url):
+def extrair_contatos(url):
     try:
         r = requests.get(url, timeout=10, headers=HEADERS)
+        html = r.text
     except:
         return [], []
 
-    emails = re.findall(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+", r.text)
+    emails = re.findall(
+        r"[a-zA-Z0-9_.+-]+@(gmail\.com|outlook\.com|hotmail\.com|yahoo\.com|[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+)",
+        html
+    )
+    emails = re.findall(
+        r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+",
+        html
+    )
 
-    telefones = re.findall(r"(?:\+?55)?\s*(?:\(?\d{2}\)?)\s*(?:9?\d{4}[-.\s]?\d{4})", r.text)
-    telefones = [re.sub(r"\D", "", t) for t in telefones]
+    telefones_raw = re.findall(
+        r"(?:\+?55\s*)?(?:\(?\d{2}\)?\s*)?(9\d{4}[-.\s]?\d{4})",
+        html
+    )
 
-    telefones_formatados = []
-    for t in telefones:
-        if len(t) == 10:
-            telefones_formatados.append(f"({t[:2]}) {t[2:6]}-{t[6:]}")
-        elif len(t) == 11:
-            telefones_formatados.append(f"({t[:2]}) {t[2:7]}-{t[7:]}")
+    telefones = []
 
-    return list(set(emails)), list(set(telefones_formatados))
+    for numero_match in telefones_raw:
+        numero = re.sub(r"\D", "", numero_match)
+
+        possiveis = re.findall(
+            r"(?:\+?55)?\s*(\d{2})\s*(" + numero + r")",
+            html
+        )
+
+        if not possiveis:
+            continue
+
+        ddd = possiveis[0][0]
+
+        if not numero.startswith("9") or len(numero) != 9:
+            continue
+
+        telefone_formatado = f"({ddd}) {numero[:5]}-{numero[5:]}"
+        telefones.append(telefone_formatado)
+
+    return list(set(emails)), list(set(telefones))
 
 
 def buscar_sites_google(busca):
@@ -82,11 +106,13 @@ def salvar_excel(df, nome_arquivo):
 
 def main():
     print("=" * 50)
-    print(f"BOT DE LEADS - META: {META_LEADS}")
+    print(f"BOT DE LEADS (WHATSAPP + EMAIL) - META: {META_LEADS}")
     print("=" * 50)
 
     df = carregar_excel("leads.xlsx")
-    emails_existentes = set(df["email"].str.lower().dropna().values)
+
+    emails_existentes = set(df["email"].dropna().str.lower().values)
+    telefones_existentes = set(df["telefone"].dropna().values)
 
     total_leads = len(df)
 
@@ -97,7 +123,7 @@ def main():
 
         nicho = random.choice(nichos)
         cidade = random.choice(cidades)
-        busca = f"{nicho} {cidade}"
+        busca = f"{nicho} {cidade} contato whatsapp email gmail"
 
         print(f"Buscando: {busca}")
 
@@ -107,14 +133,17 @@ def main():
             if total_leads >= META_LEADS:
                 break
 
-            emails, telefones = extrair_emails_e_telefones(site)
+            emails, telefones = extrair_contatos(site)
 
-            for email in emails:
-                email_lower = email.lower()
-                if email_lower in emails_existentes:
+            for i in range(max(len(emails), len(telefones))):
+                email = emails[i] if i < len(emails) else ""
+                telefone = telefones[i] if i < len(telefones) else ""
+
+                if email and email.lower() in emails_existentes:
                     continue
 
-                telefone = telefones[0] if telefones else ""
+                if telefone and telefone in telefones_existentes:
+                    continue
 
                 nova_linha = pd.DataFrame([{
                     "empresa": "",
@@ -126,10 +155,14 @@ def main():
 
                 df = pd.concat([df, nova_linha], ignore_index=True)
 
-                emails_existentes.add(email_lower)
+                if email:
+                    emails_existentes.add(email.lower())
+                if telefone:
+                    telefones_existentes.add(telefone)
+
                 total_leads += 1
 
-                print(f"[{total_leads}/{META_LEADS}] {email}")
+                print(f"[{total_leads}/{META_LEADS}] {email} | {telefone}")
 
                 if total_leads % 50 == 0:
                     salvar_excel(df, "leads.xlsx")
@@ -140,7 +173,7 @@ def main():
         time.sleep(INTERVALO_BUSCA)
 
     salvar_excel(df, "leads.xlsx")
-    print("\Script encerrado.")
+    print("\nScript encerrado.")
 
 
 if __name__ == "__main__":

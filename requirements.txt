@@ -1,0 +1,7 @@
+playwright
+selenium
+requests
+beautifulsoup4
+pandas
+lxml
+openpyxl
