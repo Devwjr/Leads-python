@@ -1,8 +1,5 @@
-#!/usr/bin/env python3
 import re
-import sys
 import time
-import json
 import random
 import asyncio
 import argparse
@@ -12,10 +9,13 @@ from pathlib import Path
 
 import aiohttp
 import primp
+import requests
 import pandas as pd
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
 
+META_LEADS = 1000
+INTERVALO_BUSCA = 30
 
 log = logging.getLogger(__name__)
 logging.getLogger("primp").setLevel(logging.WARNING)
@@ -23,16 +23,42 @@ logging.getLogger("primp").setLevel(logging.WARNING)
 _BROWSER = None
 _PLAYWRIGHT = None
 
+HEADERS = {
+    "User-Agent": "Mozilla/5.0",
+}
 
-def setup_logging(log_file: str = "bot.log"):
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        handlers=[
-            logging.FileHandler(log_file, encoding="utf-8"),
-            logging.StreamHandler(),
-        ],
+def carregar_lista(arquivo):
+    try:
+        with open(arquivo) as f:
+            return [l.strip() for l in f.readlines() if l.strip()]
+    except:
+        return []
+
+nichos = carregar_lista("nichos.txt")
+cidades = carregar_lista("cidades.txt")
+
+def extrair_contatos(url):
+    try:
+        r = requests.get(url, timeout=10, headers=HEADERS)
+        html = r.text
+    except:
+        return [], []
+
+    emails = re.findall(
+        r"[a-zA-Z0-9_.+-]+@(gmail\.com|outlook\.com|hotmail\.com|yahoo\.com|[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+)",
+        html
     )
+    emails = re.findall(
+        r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+",
+        html
+    )
+
+    telefones_raw = re.findall(
+        r"(?:\+?55\s*)?(?:\(?\d{2}\)?\s*)?(9\d{4}[-.\s]?\d{4})",
+        html
+    )
+
+    return list(set(emails)), []
 
 
 def carregar_config(caminho: str = "config.json") -> dict:
@@ -134,13 +160,17 @@ def extrair_emails_e_telefones(texto: str, allowed_domains: list[str] | None = N
     ))
     telefones_raw = re.findall(r"(?:\+?55)?\s*(?:\(?\d{2}\)?)\s*(?:9?\d{4}[-.\s]?\d{4})", texto)
     telefones = []
-    for t in telefones_raw:
-        t = re.sub(r"\D", "", t)
-        if len(t) == 10:
-            telefones.append(f"({t[:2]}) {t[2:6]}-{t[6:]}")
-        elif len(t) == 11:
-            telefones.append(f"({t[:2]}) {t[2:7]}-{t[7:]}")
-    return emails, list(set(telefones))
+    for raw in telefones_raw:
+        nums = re.sub(r"\D", "", raw)
+        if len(nums) >= 10:
+            nums = nums[-10:] if len(nums) > 10 else nums
+            ddd, num = nums[:2], nums[2:]
+            if 8 <= len(num) <= 9:
+                if len(num) == 9:
+                    telefones.append(f"({ddd}) {num[:5]}-{num[5:]}")
+                else:
+                    telefones.append(f"({ddd}) 9{num[:4]}-{num[4:]}")
+    return emails, telefones
 
 
 async def extrair_dados_site(
@@ -342,64 +372,15 @@ def fechar_browser():
         _PLAYWRIGHT = None
 
 
-def carregar_excel(arquivo: str) -> pd.DataFrame:
-    path = Path(arquivo)
-    if path.exists():
-        return pd.read_excel(path)
-    return pd.DataFrame(columns=["empresa", "email", "telefone", "cidade", "nicho"])
+def carregar_excel(nome_arquivo):
+    try:
+        return pd.read_excel(nome_arquivo)
+    except:
+        return pd.DataFrame(columns=["empresa", "email", "telefone", "cidade", "nicho"])
 
 
-def salvar_excel(df: pd.DataFrame, arquivo: str):
-    temp = Path(arquivo + ".tmp")
-    final = Path(arquivo)
-    df.to_excel(temp, index=False)
-    temp.replace(final)
-    log.info("Salvo %s leads em %s", len(df), arquivo)
-
-
-async def processar_sites(
-    sites: list[str],
-    cidade: str,
-    nicho: str,
-    emails_existentes: set[str],
-    meta_leads: int,
-    config: dict,
-) -> list[dict]:
-    novos_leads: list[dict] = []
-    semaforo = asyncio.Semaphore(config["concorrencia"])
-
-    async with aiohttp.ClientSession() as session:
-
-        async def processar(site: str):
-            async with semaforo:
-                empresa, emails, telefones = await extrair_dados_site(
-                    session,
-                    site,
-                    config["user_agents"],
-                    config["proxies"],
-                    config["timeout"],
-                    config.get("allowed_domains"),
-                )
-            if not emails:
-                return
-            telefone = telefones[0] if telefones else ""
-            for email in emails:
-                email_lower = email.lower()
-                if email_lower in emails_existentes:
-                    continue
-                novos_leads.append({
-                    "empresa": empresa,
-                    "email": email,
-                    "telefone": telefone,
-                    "cidade": cidade,
-                    "nicho": nicho,
-                })
-                emails_existentes.add(email_lower)
-
-        tarefas = [asyncio.create_task(processar(site)) for site in sites]
-        await asyncio.gather(*tarefas)
-
-    return novos_leads
+def salvar_excel(df, nome_arquivo):
+    df.to_excel(nome_arquivo, index=False)
 
 
 def executar_busca(
@@ -420,35 +401,12 @@ def main():
     config = merge_config(args)
     setup_logging(config["arquivo_log"])
 
-    if args.limpar:
-        dominios = config.get("allowed_domains", [])
-        df = carregar_excel(config["arquivo_excel"])
-        antes = len(df)
-        df = df[df["email"].apply(lambda e: email_em_dominios_permintidos(str(e), dominios))]
-        removidos = antes - len(df)
-        salvar_excel(df, config["arquivo_excel"])
-        log.info("Limpeza: %s leads removidos, %s restantes", removidos, len(df))
-        return
+    df = carregar_excel("leads.xlsx")
 
-    if args.enviar:
-        import disparo
-        disparo.disparar(config, args.limite, args.forcar)
-        return
+    emails_existentes = set(df["email"].dropna().str.lower().values)
+    telefones_existentes = set(df["telefone"].dropna().values)
 
-    log.info("=" * 50)
-    log.info("BOT DE LEADS - META: %s", config["meta_leads"])
-    log.info("=" * 50)
-
-    nichos = carregar_lista("nichos.txt")
-    cidades = carregar_lista("cidades.txt")
-    if not nichos or not cidades:
-        log.error("nichos.txt ou cidades.txt vazios ou ausentes")
-        return
-
-    df = carregar_excel(config["arquivo_excel"])
-    emails_existentes: set[str] = set(df["email"].str.lower().dropna().values)
     total_leads = len(df)
-    ultimo_salvamento = total_leads
 
     buscas_por_ciclo = config.get("buscas_por_ciclo", 3)
     max_sites = config["max_sites_por_busca"]
@@ -509,9 +467,6 @@ def main():
             if total_leads >= config["meta_leads"]:
                 break
             time.sleep(config["intervalo_busca"])
-
-    salvar_excel(df, config["arquivo_excel"])
-    log.info("Script encerrado. Total: %s leads", total_leads)
 
 
 if __name__ == "__main__":
