@@ -7,15 +7,21 @@ import random
 import asyncio
 import argparse
 import logging
+import concurrent.futures
 from pathlib import Path
 
 import aiohttp
+import primp
 import pandas as pd
 from bs4 import BeautifulSoup
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
+from playwright.sync_api import sync_playwright
 
 
 log = logging.getLogger(__name__)
+logging.getLogger("primp").setLevel(logging.WARNING)
+
+_BROWSER = None
+_PLAYWRIGHT = None
 
 
 def setup_logging(log_file: str = "bot.log"):
@@ -32,12 +38,13 @@ def setup_logging(log_file: str = "bot.log"):
 def carregar_config(caminho: str = "config.json") -> dict:
     padrao = {
         "meta_leads": 1000,
-        "intervalo_busca": 30,
+        "intervalo_busca": 15,
         "arquivo_excel": "leads.xlsx",
         "arquivo_log": "bot.log",
-        "timeout": 10,
-        "max_sites_por_busca": 20,
-        "concorrencia": 5,
+        "timeout": 5,
+        "max_sites_por_busca": 40,
+        "concorrencia": 15,
+        "buscas_por_ciclo": 3,
         "user_agents": [
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15",
@@ -165,45 +172,174 @@ async def extrair_dados_site(
     return empresa, emails, telefones
 
 
-def buscar_sites_google(
-    busca: str, max_sites: int, user_agents: list[str]
-) -> list[str]:
+def buscar_sites_duckduckgo(busca: str, max_sites: int, user_agents: list[str]) -> list[str]:
     links: list[str] = []
+    ua = random.choice(user_agents)
     try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=True,
-                args=[
-                    "--disable-blink-features=AutomationControlled",
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                ],
-            )
-            context = browser.new_context(
-                user_agent=random.choice(user_agents),
-                viewport={"width": 1920, "height": 1080},
-                locale="pt-BR",
-                timezone_id="America/Sao_Paulo",
-            )
-            context.add_init_script("""
-                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-            """)
-            page = context.new_page()
-            url = f"https://www.google.com/search?q={busca}&num=30&hl=pt-BR"
-            page.goto(url, timeout=15000)
-            page.wait_for_timeout(1000)
-
-            for a in page.locator("a[href^='http']").all():
-                href = a.get_attribute("href") or ""
-                if "google" not in href and "youtube" not in href:
-                    links.append(href.split("#")[0])
-
-            browser.close()
-    except PlaywrightTimeout:
-        log.warning("Timeout ao buscar: %s", busca)
+        client = primp.Client(
+            headers={
+                "User-Agent": ua,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Origin": "https://html.duckduckgo.com",
+                "Referer": "https://html.duckduckgo.com/",
+            },
+            follow_redirects=True,
+        )
+        client.get("https://html.duckduckgo.com/")
+        resp = client.post(
+            "https://html.duckduckgo.com/html/",
+            data={"q": busca},
+        )
+        if resp.status_code == 200:
+            soup = BeautifulSoup(resp.text, "html.parser")
+            for a in soup.find_all("a", href=True):
+                href = a["href"]
+                if href.startswith("http") and "duckduckgo" not in href:
+                    links.append(href)
+        elif resp.status_code == 202:
+            log.warning("DuckDuckGo rate limit (202)")
     except Exception as e:
-        log.error("Erro ao buscar %s: %s", busca, e)
-    return list(set(links))[:max_sites]
+        log.error("Erro DuckDuckGo [%s]: %s", busca, e)
+    return list(dict.fromkeys(links))[:max_sites]
+
+
+def buscar_sites_bing(busca: str, max_sites: int, user_agents: list[str]) -> list[str]:
+    links: list[str] = []
+    ua = random.choice(user_agents)
+    try:
+        client = primp.Client(
+            headers={
+                "User-Agent": ua,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+            },
+            follow_redirects=True,
+        )
+        resp = client.get(
+            "https://www.bing.com/search",
+            params={"q": busca, "count": str(max_sites), "setlang": "pt-br"},
+        )
+        if resp.status_code == 200:
+            soup = BeautifulSoup(resp.text, "html.parser")
+            for a in soup.select("li.b_algo h2 a"):
+                href = a.get("href")
+                if href and href.startswith("http"):
+                    links.append(href)
+            for a in soup.select("a[href^='http']"):
+                href = a["href"]
+                parent_classes = a.parent.get("class", []) if a.parent else []
+                if "b_algo" in str(parent_classes) or a.find_parent("li", class_="b_algo"):
+                    if href.startswith("http") and href not in links:
+                        links.append(href)
+    except Exception as e:
+        log.error("Erro Bing [%s]: %s", busca, e)
+
+    links = list(dict.fromkeys(links))
+    seen = set()
+    resultado = []
+    for link in links:
+        if link not in seen:
+            seen.add(link)
+            resultado.append(link)
+    return resultado[:max_sites]
+
+
+def buscar_sites_google(busca: str, max_sites: int, user_agents: list[str]) -> list[str]:
+    global _BROWSER, _PLAYWRIGHT
+    links: list[str] = []
+    for tentativa in range(3):
+        try:
+            if _PLAYWRIGHT is None:
+                _PLAYWRIGHT = sync_playwright()
+                _PLAYWRIGHT.start()
+            if _BROWSER is None:
+                _BROWSER = _PLAYWRIGHT.chromium.launch(
+                    headless=True,
+                    args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
+                )
+            context = _BROWSER.new_context(
+                user_agent=random.choice(user_agents),
+                locale="pt-BR",
+            )
+            page = context.new_page()
+            try:
+                page.goto(
+                    f"https://www.google.com/search?q={busca}&hl=pt-BR",
+                    timeout=15000,
+                    wait_until="domcontentloaded",
+                )
+                page.wait_for_timeout(2000)
+                for a in page.query_selector_all("a[href]"):
+                    href = a.get_attribute("href")
+                    if href and href.startswith("http") and "google.com" not in href:
+                        links.append(href)
+            except Exception as e:
+                log.debug("Erro Google page [%s]: %s", busca, e)
+            finally:
+                try:
+                    context.close()
+                except Exception:
+                    pass
+            break
+        except Exception as e:
+            log.debug("Erro Google [%s] (tentativa %s): %s", busca, tentativa + 1, e)
+            if _BROWSER:
+                try:
+                    _BROWSER.close()
+                except Exception:
+                    pass
+                _BROWSER = None
+            if _PLAYWRIGHT:
+                try:
+                    _PLAYWRIGHT.stop()
+                except Exception:
+                    pass
+                _PLAYWRIGHT = None
+            time.sleep(2)
+    return list(dict.fromkeys(links))[:max_sites]
+
+
+def buscar_sites(busca: str, max_sites: int, config: dict) -> list[str]:
+    motores = []
+    if config.get("usar_duckduckgo", True):
+        motores.append(("duckduckgo", buscar_sites_duckduckgo))
+    if config.get("usar_bing", True):
+        motores.append(("bing", buscar_sites_bing))
+    if config.get("usar_google", True):
+        motores.append(("google", buscar_sites_google))
+
+    if not motores:
+        motores = [("duckduckgo", buscar_sites_duckduckgo)]
+
+    todos_links: list[str] = []
+    for nome, func in motores:
+        try:
+            links = func(busca, max_sites, config["user_agents"])
+            if links:
+                log.info("  %s: %s sites", nome, len(links))
+                todos_links.extend(links)
+        except Exception as e:
+            log.error("Erro no motor %s: %s", nome, e)
+
+    return list(dict.fromkeys(todos_links))[:max_sites]
+
+
+def fechar_browser():
+    global _BROWSER, _PLAYWRIGHT
+    if _BROWSER:
+        try:
+            _BROWSER.close()
+        except Exception:
+            pass
+        _BROWSER = None
+    if _PLAYWRIGHT:
+        try:
+            _PLAYWRIGHT.stop()
+        except Exception:
+            pass
+        _PLAYWRIGHT = None
 
 
 def carregar_excel(arquivo: str) -> pd.DataFrame:
@@ -266,7 +402,20 @@ async def processar_sites(
     return novos_leads
 
 
+def executar_busca(
+    nicho: str,
+    cidade: str,
+    max_sites: int,
+    config: dict,
+) -> list[str]:
+    busca = f"{nicho} {cidade}"
+    return buscar_sites(busca, max_sites, config)
+
+
 def main():
+    import atexit
+    atexit.register(fechar_browser)
+
     args = parse_args()
     config = merge_config(args)
     setup_logging(config["arquivo_log"])
@@ -301,45 +450,65 @@ def main():
     total_leads = len(df)
     ultimo_salvamento = total_leads
 
+    buscas_por_ciclo = config.get("buscas_por_ciclo", 3)
+    max_sites = config["max_sites_por_busca"]
+
     ciclo = 0
-    while total_leads < config["meta_leads"]:
-        ciclo += 1
-        log.info("--- CICLO %s ---", ciclo)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=buscas_por_ciclo) as executor:
+        while total_leads < config["meta_leads"]:
+            ciclo += 1
+            log.info("--- CICLO %s: %s buscas paralelas ---", ciclo, buscas_por_ciclo)
 
-        nicho = random.choice(nichos)
-        cidade = random.choice(cidades)
-        busca = f"{nicho} {cidade}"
-        log.info("Buscando: %s", busca)
+            pares = []
+            for _ in range(buscas_por_ciclo):
+                nicho = random.choice(nichos)
+                cidade = random.choice(cidades)
+                pares.append((nicho, cidade, max_sites, config))
 
-        sites = buscar_sites_google(
-            busca, config["max_sites_por_busca"], config["user_agents"]
-        )
-        if not sites:
-            log.info("Nenhum site encontrado, aguardando...")
-            time.sleep(config["intervalo_busca"])
-            continue
+            futuros = [
+                executor.submit(executar_busca, n, c, m, cfg)
+                for n, c, m, cfg in pares
+            ]
+            todas_sites: list[str] = []
+            for futuro in concurrent.futures.as_completed(futuros):
+                try:
+                    sites = futuro.result()
+                    todas_sites.extend(sites)
+                except Exception as e:
+                    log.error("Erro em busca paralela: %s", e)
 
-        novos_leads = asyncio.run(
-            processar_sites(
-                sites, cidade, nicho, emails_existentes, config["meta_leads"], config
+            todas_sites = list(dict.fromkeys(todas_sites))
+            log.info("Total sites unicos: %s", len(todas_sites))
+
+            if not todas_sites:
+                log.info("Nenhum site encontrado, aguardando %ss...", config["intervalo_busca"])
+                time.sleep(config["intervalo_busca"])
+                continue
+
+            novos_leads = asyncio.run(
+                processar_sites(
+                    todas_sites, pares[0][1], pares[0][0],
+                    emails_existentes, config["meta_leads"], config,
+                )
             )
-        )
 
-        if novos_leads:
-            idx = total_leads
-            for lead in novos_leads:
-                idx += 1
-                log.info("[%s/%s] %s", idx, config["meta_leads"], lead["email"])
+            if novos_leads:
+                idx = total_leads
+                for lead in novos_leads:
+                    idx += 1
+                    log.info("[%s/%s] %s", idx, config["meta_leads"], lead["email"])
 
-            df = pd.concat([df, pd.DataFrame(novos_leads)], ignore_index=True)
-            total_leads += len(novos_leads)
+                df = pd.concat([df, pd.DataFrame(novos_leads)], ignore_index=True)
+                total_leads += len(novos_leads)
 
-        if total_leads - ultimo_salvamento >= 50 or total_leads >= config["meta_leads"]:
-            salvar_excel(df, config["arquivo_excel"])
-            ultimo_salvamento = total_leads
+            if novos_leads:
+                salvar_excel(df, config["arquivo_excel"])
+                ultimo_salvamento = total_leads
 
-        log.info("--- CICLO %s: +%s leads (total: %s) ---", ciclo, len(novos_leads), total_leads)
-        time.sleep(config["intervalo_busca"])
+            log.info("--- CICLO %s: +%s leads (total: %s) ---", ciclo, len(novos_leads), total_leads)
+            if total_leads >= config["meta_leads"]:
+                break
+            time.sleep(config["intervalo_busca"])
 
     salvar_excel(df, config["arquivo_excel"])
     log.info("Script encerrado. Total: %s leads", total_leads)
